@@ -106,3 +106,10 @@ bash rootAVD.sh A10 || {
     echo "[!] execution failed"
     exit 1
 }
+
+wait 10
+
+bash rootAVD.sh A14PR || {
+    echo "[!] execution failed"
+    exit 1
+}

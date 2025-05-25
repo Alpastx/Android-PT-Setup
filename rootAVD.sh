@@ -95,12 +95,50 @@ function A10() {
 
 # Function to root Android 14
 function A14PR() {
-    echo -e "\n[*] Setting up Android 14 AVD\n"
-    cd $HOME/android_sdk/rootAVD || {
+    echo -e "\n[*] Setting up Android 14 Pro emulator with root\n"
+
+    # Check if rootAVD exists
+    if [ ! -d "$HOME/android_sdk/rootAVD" ]; then
         echo "[!] rootAVD directory not found"
+        echo "Please ensure rootAVD is installed in $HOME/android_sdk/rootAVD"
+        exit 1
+    fi
+
+    # Check for system image
+    SYSTEM_IMAGE="$HOME/android_sdk/system-images/android-34/google_apis_playstore/x86_64/ramdisk.img"
+    if [ ! -f "$SYSTEM_IMAGE" ]; then
+        echo "[!] System image not found"
+        echo "Please ensure Android 14 system image is installed"
+        exit 1
+    fi
+
+    echo "[*] Starting Android 14 emulator..."
+    emulator -avd A14PR > /dev/null 2>&1 &
+    
+    echo "[*] Waiting for emulator to boot..."
+    adb wait-for-device
+    sleep 30
+
+    echo "[*] Rooting Android 14 emulator..."
+    cd "$HOME/android_sdk/rootAVD" || {
+        echo "[!] Failed to access rootAVD directory"
         exit 1
     }
-    ./rootAVD.sh "$AVD_NAME" Magisk.zip
+    
+    ./rootAVD.sh "$SYSTEM_IMAGE" || {
+        echo "[!] Failed to root the emulator"
+        exit 1
+    }
+
+    echo "[*] Waiting for root process to complete..."
+    sleep 10
+
+    echo "[*] Rebooting emulator to apply changes..."
+    adb reboot
+
+    echo "[✓] Android 14 emulator has been rooted successfully"
+    echo "[*] The emulator will restart automatically"
+    echo "[*] After restart, Magisk will be available in the system"
 }
 
 # Check AVD name and call appropriate function
