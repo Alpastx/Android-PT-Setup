@@ -1,27 +1,27 @@
 #!/bin/bash
-
 AVD_NAME="$1"
-
 if [[ -z "$AVD_NAME" ]]; then
-    echo "Usage: $0 <AVD_NAME>"
-    exit 1
+        echo "Usage: $0 <AVD_NAME>"
+        exit 1
 fi
+set -euo pipefail
 
-CONFIG_FILE="$HOME/.config/.android/avd/${AVD_NAME}.avd/config.ini"
+main() {
+    
+    local ConfigFile="$HOME/.config/.android/avd/${AVD_NAME}.avd/config.ini"
+    if [[ ! -f "$ConfigFile" ]]; then
+        echo "[-] AVD config file not found: $ConfigFile"
+        exit 1
+    else
+        echo "[*] Patching $ConfigFile..."
+        #remove old entries
+        sed -i '/^hw\.keyboard=/d' "$ConfigFile"
+        sed -i '/^hw\.mainKeys=/d' "$ConfigFile"
+        #append new entries
+        echo "hw.keyboard=yes" >> "$ConfigFile"
+        echo "hw.mainKeys=yes" >> "$ConfigFile"
+        echo "[+] Hardware keyboard and main keys enabled for $AVD_NAME."
+    fi
+}
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "[-] AVD config file not found: $CONFIG_FILE"
-    exit 1
-fi
-
-echo "[*] Patching $CONFIG_FILE..."
-
-# Remove old entries if they exist
-sed -i '/^hw\.keyboard=/d' "$CONFIG_FILE"
-sed -i '/^hw\.mainKeys=/d' "$CONFIG_FILE"
-
-# Append hardware key settings
-echo "hw.keyboard=yes" >> "$CONFIG_FILE"
-echo "hw.mainKeys=yes" >> "$CONFIG_FILE"
-
-echo "[+] Hardware keyboard and main keys enabled for $AVD_NAME."
+main "$@"
