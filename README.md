@@ -29,9 +29,11 @@ bash setup.sh
 ## Verify
 
 ```bash
-bash verify.sh          # Static checks (tools, files, config)
-bash verify.sh --live   # Full check (starts emulators, validates root, certs, proxy)
+bash verify.sh          # Static checks (see below)
+bash verify.sh --live   # Also boots each AVD briefly (root, proxy on A10, Magisk hint on A14PR)
 ```
+
+**Static checks:** `ANDROID_HOME` / `~/android_sdk`, host tools (`git`, `pipx`, `openssl`; `jadx` optional), SDK tools (`adb`, `sdkmanager`, `avdmanager`; `emulator` warns if missing), pipx tools (`frida`, `objection`, `apkleaks`, `pyapktool` or `apktool`), `burp.der` beside the repo scripts, AVDs and system images, `rootAVD` + `Magisk.zip`, shell RC entries (including `A14PR` alias). **Live checks:** `adb root` / `su` where applicable, optional frida-server on device, HTTP proxy **only for A10**, CA store sanity on A10, Magisk on A14PR.
 
 ## Uninstall
 

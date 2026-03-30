@@ -538,48 +538,42 @@ Frida scripts for universal SSL bypass, OkHttp pinning, or root hiding are **not
 
 ## Verifying Your Setup
 
-After setup completes, run the health check:
+After setup completes, run the health check from the **repository directory**:
 
 ```bash
 bash verify.sh
 ```
 
-This validates:
-- Environment variables and PATH
-- SDK tools and pipx-installed tools (frida, objection, apkleaks, etc.)
-- **jadx** — warns if missing (optional)
-- AVDs exist (A10, A14PR)
-- System images and rootAVD/Magisk artifacts
-- Shell configuration correct
+`verify.sh` performs **static** checks aligned with `setup.sh`:
 
-For a deeper check that starts emulators and validates root, certs, and proxy:
+- **Environment:** `ANDROID_HOME` or a warning if only `~/android_sdk` exists; SDK directory present
+- **Host prerequisites:** `git`, `pipx`, `openssl`; **jadx** optional (warn)
+- **SDK tools:** `adb`, `sdkmanager`, `avdmanager`; **`emulator`** warns if missing (install with `sdkmanager --install "emulator"`)
+- **Pipx tools:** `frida`, `objection`, `apkleaks`; **`pyapktool`** or standalone **`apktool`**
+- **`burp.der`** next to the repo scripts (warn if missing)
+- **AVDs** A10 / A14PR, **system images**, **`~/android_sdk/rootAVD`** and **`Magisk.zip`**
+- **Shell RC:** `ANDROID_HOME`, **`A10`** and **`A14PR`** aliases
+
+For **live** checks (starts each emulator briefly):
 
 ```bash
 bash verify.sh --live
 ```
 
-Example output:
+This runs `adb root`, checks boot, optional **frida-server** on device (warn if absent), **HTTP proxy only on A10** (A14PR skips proxy — matches current setup), system CA store sanity on A10, and Magisk visibility on A14PR.
+
+Example output (abbreviated):
 ```
 ╔══════════════════════════════════════════════╗
-║   Android-PT-Setup Verification              ║
+║   Android-PT-Setup verification              ║
 ╚══════════════════════════════════════════════╝
 
-=== Environment ===
-  [PASS] ANDROID_HOME set: /home/user/android_sdk
-  [PASS] Android SDK directory exists
-
-=== SDK Tools ===
-  [PASS] adb found: /home/user/android_sdk/platform-tools/adb
-  [PASS] emulator found: /home/user/android_sdk/emulator/emulator
-  ...
-
-=== Pentesting Tools ===
-  [PASS] frida found: /home/user/.local/bin/frida
-  [PASS] objection found: /home/user/.local/bin/objection
+=== Host prerequisites (setup.sh) ===
+  [PASS] git found: ...
   ...
 
 ════════════════════════════════════════════════
-  Results: 18 passed, 0 failed, 0 warnings
+  Results: N passed, 0 failed, M warnings
 ════════════════════════════════════════════════
 ```
 
