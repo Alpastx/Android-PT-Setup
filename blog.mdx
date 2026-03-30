@@ -9,7 +9,7 @@ tags: ["android", "penetration-testing", "automation", "mobile-security", "emula
 
 # Automating an Android Penetration Testing Lab from Scratch
 
-In this post, we build a **fully automated** Android penetration testing environment from scratch — no Android Studio, no manual clicking, no guesswork. We download the SDK directly from Google, create two rooted Android Virtual Devices (Android 10 and Android 14), install a Burp Suite certificate into the system CA store, root with Magisk, and install essential pentesting tools — all with a single command. We also explore the internals of how each piece works so you can adapt it to your own workflow.
+In this post, we build a **fully automated** Android penetration testing environment from scratch — no Android Studio, no manual clicking, no guesswork. We download the SDK directly from Google, create two Android Virtual Devices: **A10** gets a writable system, Burp CA in the system store, and an HTTP proxy to your host; **A14PR** is rooted with **Magisk** via rootAVD. Host pentesting tools install via **pipx**. All with a single command. We also explore the internals of how each piece works so you can adapt it to your own workflow.
 
 ---
 
@@ -25,7 +25,7 @@ If you've ever set up an Android pentesting lab manually, you know the pain:
 
 Every step has a timing dependency. Run `adb remount` before the system is fully booted? Silent failure. Push a certificate before getting root? Nothing happens. Forget `hw.keyboard=yes`? Enjoy tapping on-screen keys forever.
 
-**Android-PT-Setup** automates all of this into a single `bash setup.sh` that takes you from zero to two rooted, Burp-ready emulators.
+**Android-PT-Setup** automates this into a single `bash setup.sh` that takes you from zero to a working **A10** (Burp + proxy) and **A14PR** (Magisk).
 
 ---
 
@@ -35,18 +35,14 @@ By the end of this setup, you'll have:
 
 | Device | Android Version | Root Method | Key Features |
 |--------|----------------|-------------|-------------|
-| **A10** | Android 10 (API 29) | System root + AVB disabled | Burp CA cert, proxy auto-configured, frida-server |
-| **A14PR** | Android 14 (API 34) | Magisk (systemless) | Play Store, Burp cert via Magisk module, proxy, frida-server |
+| **A10** | Android 10 (API 29) | `adb root` + writable system + AVB disabled | Burp CA in system store, HTTP proxy to host (`10.0.2.2`) |
+| **A14PR** | Android 14 (API 34) | Magisk (systemless, via rootAVD) | Play Store; no automated Burp/proxy in this repo |
 
-Plus these tools installed and ready:
+Plus these **host** tools (via **pipx** where noted):
 
-- **frida-tools + frida-server** — Dynamic instrumentation (client on host, server on device)
-- **objection** — Frida-powered runtime mobile exploration
-- **apkleaks** — Static scanner for URIs, endpoints, and hardcoded secrets
-- **jadx** — Java decompiler for APK reverse engineering
-- **apktool** — APK unpacker/repacker
-- **Magisk** — Systemless root framework
-- **SSL bypass scripts** — Ready-to-use Frida scripts for pinning bypass and root detection evasion
+- **frida-tools**, **objection**, **apkleaks**, **pyapktool** — installed with pipx during setup
+- **jadx** — install separately (optional but recommended); used for static analysis
+- **Magisk** — patched into A14PR’s ramdisk by rootAVD; **frida-server on device** is **not** installed automatically — push and run it yourself when you need Frida against apps
 
 ---
 
@@ -61,9 +57,13 @@ You need a Linux machine. The scripts support:
 You also need:
 
 - **20GB+ free disk space** (system images are large)
-- **burp.der** — Your Burp Suite CA certificate exported in DER format
+- **git** and **pipx** on your `PATH` (the setup script asks you to confirm; **jadx** is optional and only warned if missing)
+- **OpenSSL** (`openssl` CLI) for certificate conversion during A10 setup
+- **burp.der** — your Burp Suite CA certificate in DER format, placed next to `setup.sh` (or set **`BURP_DER`** when running `rootAVD.sh` alone). Running `setup.sh` **changes into the script directory first**, so paths do not depend on where you invoked `bash` from.
 
-To export the certificate from Burp Suite: go to **Proxy → Options → Import / Export CA certificate → Export Certificate in DER format**. Save it as `burp.der` in the project directory.
+To export the certificate from Burp Suite: **Proxy → Options → Import / Export CA certificate → Export Certificate in DER format**.
+
+During setup, **Android SDK licenses** are accepted non-interactively with `yes | sdkmanager --licenses` so image installs do not hang on first run.
 
 ---
 
@@ -461,61 +461,29 @@ apkleaks -f target.apk
 
 ### Static Analysis: jadx and apktool
 
-The setup also installs **jadx** (Java decompiler) and **apktool** (APK unpacker/repacker) via your system package manager:
+**jadx** is not installed by this repo — install your distro’s package so `jadx` is on `PATH` when you need it. **pyapktool** is installed via pipx during setup.
 
 ```bash
-# Decompile an APK to readable Java source
+# Decompile an APK to readable Java source (after installing jadx)
 jadx -d output/ target.apk
 
-# Unpack APK for resource inspection and repackaging
-apktool d target.apk -o unpacked/
+# Unpack APK (pyapktool / apktool depending on what you installed)
 ```
-
-These are essential for understanding app internals before dynamic testing.
 
 ---
 
-## Step 7: Auto-Pushing Frida Server to Emulators
+## Step 7: Frida on the host vs frida-server on the device
 
-Having `frida-tools` on the host is only half the equation. You also need `frida-server` running on the device. The setup handles this automatically.
+`frida-tools` is installed on the **host** with pipx. To instrument apps on an emulator you still need **frida-server** on the **device**, matching your host `frida --version`. This project **does not** download or push frida-server automatically.
 
-The `install_frida_server()` function in `lib.sh`:
+Typical workflow:
 
-1. **Reads the host frida version** via `frida --version` — client and server MUST match exactly
-2. **Detects device architecture** via `adb shell getprop ro.product.cpu.abi` (x86 for A10, x86_64 for A14PR)
-3. **Downloads the matching server** from GitHub releases
-4. **Pushes to `/data/local/tmp/frida-server`** and makes it executable
-5. **Verifies** the version matches
+1. Download the matching `frida-server-*-android-*.xz` from [Frida releases](https://github.com/frida/frida/releases) for your emulator ABI (`adb shell getprop ro.product.cpu.abi`).
+2. Extract, `adb push` to `/data/local/tmp/frida-server`, `chmod 755`.
+3. Run `adb shell "/data/local/tmp/frida-server &"` (or use `adb shell` and run in background).
+4. From the host: `frida-ps -U`, `frida -U -f com.example.app -l your-script.js`.
 
-```bash
-install_frida_server() {
-    local frida_version
-    frida_version=$(frida --version 2>/dev/null)
-
-    local device_arch
-    device_arch=$(adb shell getprop ro.product.cpu.abi | tr -d '\r\n')
-
-    local download_url="https://github.com/frida/frida/releases/download/${frida_version}/frida-server-${frida_version}-android-${device_arch}.xz"
-
-    curl -fsSL "$download_url" -o /tmp/frida-server.xz
-    xz -d /tmp/frida-server.xz
-    adb push /tmp/frida-server /data/local/tmp/frida-server
-    adb shell chmod 755 /data/local/tmp/frida-server
-}
-```
-
-To use it after setup, start the server on the emulator and connect from your host:
-
-```bash
-# Start frida-server on device
-adb shell "/data/local/tmp/frida-server &"
-
-# List processes from host
-frida-ps -U
-
-# Hook an app
-frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
-```
+Use your own or community Frida scripts for SSL pinning bypass and root checks — they are not bundled in this repository.
 
 ---
 
@@ -554,58 +522,17 @@ adb shell settings delete global http_proxy
 
 ---
 
-## Step 9: Burp Certificate on A14PR via Magisk
+## Step 9: Burp on A10 vs A14PR
 
-A10 gets the Burp certificate directly in the system CA store (writable system). But A14PR's system partition is protected — we can't just push files to `/system/`.
+**A10** installs your Burp CA into `/system/etc/security/cacerts/` and sets the global HTTP proxy to your host (`10.0.2.2`, port from `BURP_PORT` or `8080`).
 
-The solution: **MagiskTrustUserCerts** — a Magisk module that automatically copies user-installed certificates to the system store on every boot.
-
-The setup:
-1. Downloads the MagiskTrustUserCerts module from GitHub during `Tools-downloader.sh`
-2. After Magisk rooting completes, pushes and installs the module via `magisk --install-module`
-3. Installs the Burp cert as a user certificate
-4. Reboots — the module promotes the user cert to system trust
-
-This means both A10 and A14PR trust your Burp certificate at the system level, allowing HTTPS interception for apps that only trust system CAs.
+**A14PR** is rooted with Magisk only (ramdisk patch via rootAVD). This repository **does not** automate Burp trust on A14PR (no MagiskTrustUserCerts flow, no proxy step). If you need HTTPS interception there, install a user CA in the emulator, use a Magisk module you trust, or rely on Frida/network tooling — that is outside the automated script.
 
 ---
 
-## Step 10: Bundled Frida Scripts for SSL & Root Bypass
+## Step 10: Frida scripts for SSL and root bypass
 
-The `scripts/` directory contains ready-to-use Frida scripts:
-
-### Universal SSL Pinning Bypass (`ssl-bypass-universal.js`)
-
-Hooks 8 different SSL verification mechanisms simultaneously:
-- `TrustManagerImpl.verifyChain` (Android default)
-- `X509TrustManager.checkServerTrusted`
-- `okhttp3.CertificatePinner.check` (and obfuscated variants)
-- `Conscrypt.verifyCertificateChain`
-- `WebViewClient.onReceivedSslError`
-- `NetworkSecurityTrustManager`
-- `HostnameVerifier`
-- Legacy OkHttp v2
-
-```bash
-frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
-```
-
-### Root Detection Bypass (`root-detection-bypass.js`)
-
-Hides root indicators from apps that check:
-- File existence (`/system/bin/su`, `/sbin/magisk`, etc.)
-- `Build.TAGS` (changes `test-keys` to `release-keys`)
-- `Runtime.exec("su")` and `ProcessBuilder`
-- `SystemProperties` (`ro.debuggable`, `ro.build.type`)
-- `PackageManager` (hides Magisk, SuperSU packages)
-- Native `access()` calls via libc hooks
-
-```bash
-# Combine both for maximum compatibility
-frida -U -f com.example.app \
-  -l ~/android_sdk/scripts/ssl-bypass-universal.js \
-  -l ~/android_sdk/scripts/root-detection-bypass.js
-```
+Frida scripts for universal SSL bypass, OkHttp pinning, or root hiding are **not** shipped under `~/android_sdk/scripts/` in this project. Use scripts from your own collection, public repos, or write hooks tailored to the app. Point `frida -l` at a local `.js` file once frida-server is running on the device.
 
 ---
 
@@ -619,10 +546,10 @@ bash verify.sh
 
 This validates:
 - Environment variables and PATH
-- All tools installed (adb, frida, objection, jadx, apktool)
+- SDK tools and pipx-installed tools (frida, objection, apkleaks, etc.)
+- **jadx** — warns if missing (optional)
 - AVDs exist (A10, A14PR)
-- System images present
-- Frida scripts installed
+- System images and rootAVD/Magisk artifacts
 - Shell configuration correct
 
 For a deeper check that starts emulators and validates root, certs, and proxy:
@@ -674,7 +601,7 @@ To verify the Burp certificate is installed on A10:
 
 ```bash
 # Start A10 and check the cert
-adb shell ls /system/etc/security/cacerts/ | grep $(openssl x509 -inform der -in burp.der -out /dev/stdout 2>/dev/null | openssl x509 -subject_hash_old | head -1)
+adb shell ls /system/etc/security/cacerts/ | grep $(openssl x509 -inform der -in /path/to/burp.der -out /dev/stdout 2>/dev/null | openssl x509 -subject_hash_old | head -1)
 ```
 
 To verify Magisk root on A14PR:
@@ -688,22 +615,15 @@ adb shell su -c id
 
 ## Intercepting HTTPS Traffic with Burp Suite
 
-With the Burp certificate and proxy auto-configured on both emulators, interception is nearly zero-config:
+For **A10**, after setup the Burp CA is in the system store and the global HTTP proxy points at your host (`10.0.2.2` and your Burp port). Start Burp on the host, launch **`A10`**, and traffic from apps that trust system CAs can be intercepted.
 
-1. **Start Burp Suite** and ensure the proxy listener is on `127.0.0.1:8080` (or your custom `BURP_PORT`)
-2. **Start the emulator**: `A10` or `A14PR`
-3. **Browse** — HTTPS traffic appears in Burp immediately
+**A14PR** does not get that automation in this repo — configure trust/proxy yourself if you need Burp there.
 
-The proxy is already pointed at `10.0.2.2:8080` (your host), and the Burp CA is in the system store. No manual Settings navigation needed.
-
-For apps with SSL pinning, start frida-server and use the bypass scripts:
+For **SSL pinning**, push and run **frida-server** on the emulator (matching host Frida version), then attach with your own Frida scripts — for example:
 
 ```bash
-# On the emulator (background frida-server)
 adb shell "/data/local/tmp/frida-server &"
-
-# On your host (bypass pinning + intercept)
-frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
+frida -U -f com.example.app -l /path/to/your-bypass.js
 ```
 
 ---
@@ -741,9 +661,9 @@ The key differentiator from manual setup or basic scripts is the **reliability l
 | Wrong distro packages | Edit script manually | Auto-detection: Arch/Ubuntu/Fedora |
 | Wrong shell RC file | Hardcoded `.zshrc` | Auto-detect from `$SHELL` |
 | Re-running setup duplicates config | Double PATH entries | `grep` check before appending |
-| frida client/server mismatch | Manual version matching | Auto-detect host version, download matching server |
-| No proxy on emulator | Manual Settings navigation | Auto-configure via `adb shell settings put` |
-| No cert on A14PR | Manual Magisk module install | Auto-install MagiskTrustUserCerts |
+| frida client/server mismatch | Manual version matching | You choose matching frida-server build (not auto-pushed) |
+| No proxy on A10 | Manual Settings navigation | Auto-configure via `adb shell settings put` on A10 |
+| Burp trust on A14PR | Manual user CA / module | Not automated here — Magisk root only |
 
 ---
 
@@ -765,8 +685,7 @@ The key differentiator from manual setup or basic scripts is the **reliability l
 - Check the ramdisk path matches your architecture
 
 **Frida can't connect**
-- Ensure frida-server is running: `adb shell "/data/local/tmp/frida-server &"`
-- Check version match: `frida --version` on host should match `adb shell /data/local/tmp/frida-server --version`
+- Install and run **frida-server** on the device yourself (same major/minor as host `frida --version`)
 - Ensure the emulator is running and `adb devices` shows it
 
 ---

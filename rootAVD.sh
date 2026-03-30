@@ -2,7 +2,21 @@
 
 set -euo pipefail
 
-source "$(dirname "$0")/lib.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+# Burp DER: env BURP_DER (set by setup.sh), else file next to this script
+burp_der_path() {
+    if [[ -n "${BURP_DER:-}" && -f "$BURP_DER" ]]; then
+        echo "$BURP_DER"
+    elif [[ -f "$SCRIPT_DIR/burp.der" ]]; then
+        echo "$SCRIPT_DIR/burp.der"
+    elif [[ -n "${PWD:-}" && -f "$PWD/burp.der" ]]; then
+        echo "$PWD/burp.der"
+    else
+        echo ""
+    fi
+}
 
 show_available_avds() {
     echo "Available AVDs:"
@@ -29,16 +43,19 @@ A10() {
     # Setup cleanup trap
     trap cleanup EXIT
 
-    # Check and install OpenSSL if needed
-    if ! command -v openssl >/dev/null 2>&1; then
-        log_info "OpenSSL not found, installing..."
-        pkg_install openssl
+    local burp_der
+    burp_der=$(burp_der_path)
+    if [[ -z "$burp_der" ]]; then
+        log_fatal "burp.der not found — set BURP_DER or place burp.der in $SCRIPT_DIR"
     fi
-    log_ok "OpenSSL is installed"
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        log_fatal "OpenSSL (openssl) is required on the host for certificate conversion"
+    fi
 
     # Generate certificate files
     log_info "Converting certificate to Android format..."
-    if ! openssl x509 -inform der -in burp.der -out burp.cer 2>/dev/null; then
+    if ! openssl x509 -inform der -in "$burp_der" -out burp.cer 2>/dev/null; then
         log_fatal "Failed to convert certificate. Is burp.der a valid DER certificate?"
     fi
     register_cleanup "burp.cer"
@@ -107,15 +124,12 @@ A10() {
     # Configure proxy to point at Burp on host
     configure_proxy || log_warn "Proxy configuration failed — configure manually in Settings"
 
-    # Install frida-server on device
-    install_frida_server || log_warn "frida-server install failed — install manually later"
-
     # Final reboot to apply
     log_info "Rebooting to apply all changes..."
     adb reboot 2>/dev/null || true
     sleep 5
 
-    # Clean up — kill emulator and temp files
+    # Clean up : kill emulator and temp files
     kill_emulator
     rm -f burp.cer "${hash}.0" 2>/dev/null || true
 
@@ -164,7 +178,7 @@ A14PR() {
     (
         cd "$rootavd_dir" || log_fatal "Failed to access rootAVD directory"
         # Use path relative to ANDROID_HOME (go up from rootAVD/ to android_sdk/)
-        ./rootAVD.sh ../system-images/android-34/google_apis_playstore/x86_64/ramdisk.img
+        ./rootAVD.sh system-images/android-34/google_apis_playstore/x86_64/ramdisk.img
     ) || log_fatal "rootAVD failed to patch ramdisk"
 
     # Wait for rootAVD to finish and device to come back
@@ -174,22 +188,10 @@ A14PR() {
         adb reboot 2>/dev/null || true
         wait_for_boot 120 || log_warn "Device did not come back — check emulator manually"
     fi
-
-    # Install frida-server on device
-    adb_root_and_wait || log_warn "Could not get root — frida-server install may fail"
-    install_frida_server || log_warn "frida-server install failed — install manually later"
-
-    # Configure proxy to point at Burp on host
-    configure_proxy || log_warn "Proxy configuration failed — configure manually in Settings"
-
-    # Install Burp certificate via MagiskTrustUserCerts module
-    install_burp_cert_magisk || log_warn "Burp cert install on A14PR failed — install manually"
-
     # Disable the trap since we're done
     trap - EXIT
 
     log_ok "Android 14 emulator has been rooted successfully"
-    log_info "Magisk, frida-server, proxy, and Burp cert configured"
 }
 
 # Main dispatch

@@ -2,17 +2,27 @@
 
 set -euo pipefail
 
-source "$(dirname "$0")/lib.sh"
+SETUP_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$SETUP_ROOT" || {
+    echo "[!] Cannot cd to script directory: $SETUP_ROOT" >&2
+    exit 1
+}
 
-# Check for burp certificate
-if [[ ! -f "burp.der" ]]; then
-    log_fatal "burp.der not found. Please export Burp certificate as DER format and name it burp.der"
+source "$SETUP_ROOT/lib.sh"
+
+prompt_host_prerequisites
+
+# Burp cert lives next to setup.sh (independent of caller's cwd)
+BURP_DER="$SETUP_ROOT/burp.der"
+export BURP_DER
+if [[ ! -f "$BURP_DER" ]]; then
+    log_fatal "burp.der not found at $BURP_DER — export Burp CA as DER and save it there"
 fi
-log_ok "Found burp.der certificate"
+log_ok "Found burp certificate: $BURP_DER"
 
 log_info "Downloading Cmdlinetools, PlatformTools, Magisk"
 
-bash "$(dirname "$0")/Tools-downloader.sh" || log_fatal "Download failed"
+bash "$SETUP_ROOT/Tools-downloader.sh" || log_fatal "Download failed"
 
 log_info "Unzipping Cmdlinetools, PlatformTools"
 
@@ -41,27 +51,18 @@ rm -f platform-tools.zip cmdline-tools.zip
 
 log_info "Cloning rootAVD into android_sdk"
 
-if ! command -v git >/dev/null 2>&1; then
-    pkg_install git
-fi
 
 if [[ -d "android_sdk/rootAVD" ]]; then
     log_info "rootAVD directory already exists, skipping clone"
 else
-    git clone https://gitlab.com/newbit/rootAVD.git android_sdk/rootAVD 2>/dev/null || \
+    git clone https://gitlab.com/newbit/rootAVD.git android_sdk/rootAVD || \
         log_fatal "Failed to clone rootAVD repository"
 fi
 
 if [[ -f "Magisk.zip" ]]; then
     mv Magisk.zip android_sdk/rootAVD/Magisk.zip
 else
-    log_warn "Magisk.zip not found — A14PR rooting may fail"
-fi
-
-if [[ -f "MagiskTrustUserCerts.zip" ]]; then
-    mv MagiskTrustUserCerts.zip android_sdk/rootAVD/MagiskTrustUserCerts.zip
-else
-    log_warn "MagiskTrustUserCerts.zip not found — A14PR cert install will be skipped"
+    log_warn "Magisk.zip not found : A14PR rooting will fail"
 fi
 
 # Move SDK to home directory
@@ -102,8 +103,11 @@ export PATH="$HOME/android_sdk/cmdline-tools/latest/bin:$PATH"
 export PATH="$HOME/android_sdk/platform-tools:$PATH"
 export PATH="$HOME/android_sdk/emulator:$PATH"
 
-log_info "Installing required packages"
-pkg_install jdk pipx
+# log_info "Installing required packages"
+# pkg_install jdk pipx
+
+log_info "Accepting Android SDK licenses (non-interactive)"
+yes | sdkmanager --licenses || log_warn "sdkmanager --licenses reported an error — later steps may prompt"
 
 log_info "Installing Android system images"
 
@@ -128,23 +132,18 @@ log_info "Installing pentesting tools"
 pipx install frida-tools || log_warn "frida-tools installation failed"
 pipx install objection || log_warn "objection installation failed"
 pipx install apkleaks || log_warn "apkleaks installation failed"
-
-log_info "Installing static analysis tools"
-pkg_install jadx apktool || log_warn "Some static analysis tools failed to install"
+pipx install pyapktool || log_warn "pyapktool installation failed"
+# log_info "Installing static analysis tools"
+# pkg_install jadx apktool || log_warn "Some static analysis tools failed to install"
 
 log_info "Configuring hardware keys for AVDs"
 
-bash "$(dirname "$0")/HWKeys.sh" A10
-bash "$(dirname "$0")/HWKeys.sh" A14PR
+bash "$SETUP_ROOT/HWKeys.sh" A10
+bash "$SETUP_ROOT/HWKeys.sh" A14PR
 
 log_info "Setting up A10 with Burp certificate"
 
-if [[ ! -f "burp.der" ]]; then
-    log_fatal "burp.der not found. Please export Burp certificate as DER format and name it burp.der"
-fi
-
-log_ok "Found burp.der certificate"
-bash "$(dirname "$0")/rootAVD.sh" A10 || log_fatal "A10 Burp certificate setup failed"
+bash "$SETUP_ROOT/rootAVD.sh" A10 || log_fatal "A10 Burp certificate setup failed"
 
 # Wait for A10 cleanup before starting A14PR
 sleep 5
@@ -153,24 +152,13 @@ sleep 3
 
 log_info "Rooting A14PR with Magisk"
 
-bash "$(dirname "$0")/rootAVD.sh" A14PR || log_fatal "A14PR Magisk setup failed"
+bash "$SETUP_ROOT/rootAVD.sh" A14PR || log_fatal "A14PR Magisk setup failed"
 
-# Copy Frida scripts to SDK directory
-script_dir="$(dirname "$0")/scripts"
-if [[ -d "$script_dir" ]]; then
-    log_info "Copying Frida scripts to $ANDROID_HOME/scripts/"
-    mkdir -p "$ANDROID_HOME/scripts"
-    cp -r "$script_dir"/* "$ANDROID_HOME/scripts/" 2>/dev/null || true
-    log_ok "Frida scripts installed"
-fi
 
 log_ok "Setup completed successfully!"
 echo ""
 echo "You can now use:"
 echo "  A10   - Launch Android 10 emulator (rooted + Burp cert + proxy)"
-echo "  A14PR - Launch Android 14 emulator (Magisk + Burp cert + proxy)"
-echo ""
-echo "Frida scripts available at: $ANDROID_HOME/scripts/"
-echo "  frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js"
+echo "  A14PR - Launch Android 14 emulator (Magisk)"
 echo ""
 echo "Run: source $rc_file"

@@ -72,36 +72,6 @@ main() {
         fi
         log_ok "Magisk downloaded successfully"
     fi
-
-    # download MagiskTrustUserCerts module (for A14PR Burp cert)
-    local TrustCertsOutput="$PWD/MagiskTrustUserCerts.zip"
-    if [[ -f "$TrustCertsOutput" ]]; then
-        log_info "MagiskTrustUserCerts already downloaded, skipping"
-    else
-        local trust_certs_api="https://api.github.com/repos/NVISOsecurity/MagiskTrustUserCerts/releases/latest"
-        local trust_json
-        trust_json=$(curl -fsSL "$trust_certs_api" 2>/dev/null) || {
-            log_warn "Failed to fetch MagiskTrustUserCerts release info — A14PR cert install will be skipped"
-            return 0
-        }
-
-        local trust_url
-        trust_url=$(echo "$trust_json" | \
-                    grep -oP '"browser_download_url":\s*"\K[^"]+\.zip' | \
-                    head -n 1)
-
-        if [[ -z "$trust_url" ]]; then
-            log_warn "Failed to extract MagiskTrustUserCerts download URL"
-            return 0
-        fi
-
-        if ! curl -fsSL "$trust_url" -o "$TrustCertsOutput"; then
-            rm -f "$TrustCertsOutput"
-            log_warn "Failed to download MagiskTrustUserCerts"
-            return 0
-        fi
-        log_ok "MagiskTrustUserCerts module downloaded"
-    fi
 }
 
 main "$@"

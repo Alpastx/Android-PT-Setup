@@ -11,8 +11,12 @@ Automated Android penetration testing environment for Linux.
 ## Requirements
 
 - Linux (see supported platforms above)
-- 20GB+ free disk space
-- `burp.der` (Burp certificate in DER format)
+- **20GB+** free disk space
+- **`burp.der`** — Burp certificate (DER format) in the project directory before `setup.sh`
+- **Host tools (install yourself; not installed by this repo):** `git`, `pipx`, **OpenSSL** (`openssl` CLI); **`jadx`** is optional (recommended)
+- `setup.sh` asks you to confirm `git` and `pipx` are installed, verifies them on `PATH`, and warns if `jadx` is missing
+- Android SDK licenses are accepted non-interactively via `yes | sdkmanager --licenses` during setup
+- Place **`burp.der`** next to `setup.sh` (or export **`BURP_DER`** when running `rootAVD.sh` alone); `setup.sh` always uses the repo directory, not your current working directory
 
 ## Install
 
@@ -39,23 +43,18 @@ bash uninstall.sh
 
 ```bash
 A10      # Launch Android 10 (rooted + Burp cert + proxy)
-A14PR    # Launch Android 14 (Magisk + Burp cert + proxy)
+A14PR    # Launch Android 14 (Magisk root)
 
-# Start frida-server on device
-adb shell "/data/local/tmp/frida-server &"
-
-# Use bypass scripts
-frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
+# frida-server on the device is not installed by setup — download a build matching
+# your host frida-tools version and push to /data/local/tmp/ when needed, then:
+# adb shell "/data/local/tmp/frida-server &"
 ```
 
 ## What Gets Installed
 
-- Android SDK (platform-tools, cmdline-tools, emulator)
-- AVDs: A10 (API 29), A14PR (API 34) — both rooted with Burp cert and proxy configured
-- Dynamic tools: frida-tools + frida-server (on device), objection
-- Static tools: apkleaks, jadx, apktool
-- Magisk + rootAVD + MagiskTrustUserCerts
-- Frida scripts: SSL bypass, OkHttp bypass, root detection bypass
+- Android SDK (platform-tools, cmdline-tools; install **emulator** via `sdkmanager` if `emulator` is missing)
+- AVDs: **A10** (API 29) — rooted, Burp CA in system store, HTTP proxy to host; **A14PR** (API 34) — Magisk via rootAVD
+- **pipx:** frida-tools, objection, apkleaks, pyapktool
 
 ## Scripts
 
@@ -64,34 +63,22 @@ frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
 | `setup.sh` | Full installation |
 | `verify.sh` | Post-setup health check |
 | `uninstall.sh` | Remove everything |
-| `rootAVD.sh <AVD>` | Root AVD / install certs / push frida-server |
+| `rootAVD.sh <AVD>` | A10 Burp/system CA + proxy; A14PR Magisk ramdisk patch |
 | `HWKeys.sh <AVD>` | Enable hardware keyboard |
-| `Tools-downloader.sh` | Download SDK + Magisk + modules |
+| `Tools-downloader.sh` | Download platform-tools, cmdline-tools, Magisk APK as zip |
 | `lib.sh` | Shared utility library |
-
-## Frida Scripts
-
-Located in `~/android_sdk/scripts/` after setup:
-
-| Script | Purpose |
-|--------|---------|
-| `ssl-bypass-universal.js` | Bypass TrustManager, OkHttp, Conscrypt, WebView |
-| `ssl-bypass-okhttp.js` | Targeted OkHttp v2/v3/v4 bypass |
-| `root-detection-bypass.js` | Hide su, Magisk, Build.TAGS, native checks |
 
 ## SSL Interception
 
 1. Export Burp cert as `burp.der`
 2. Place in project directory before running `setup.sh`
-3. Certificate installs automatically on both A10 and A14PR
-4. Proxy auto-configured to `10.0.2.2:8080` (host loopback)
-5. Override port: `BURP_PORT=9090 bash setup.sh`
+3. **A10:** certificate is installed to the system CA store; proxy set to `10.0.2.2:8080` (override with `BURP_PORT`)
+4. **A14PR:** Burp trust is not automated by this repo — configure manually if needed
 
 ## File Locations
 
 ```
 ~/android_sdk/              # SDK and tools
-~/android_sdk/scripts/      # Frida bypass scripts
 ~/android_sdk/rootAVD/      # rootAVD + Magisk
 ~/.android/avd/             # AVD configs
 ```
@@ -99,35 +86,31 @@ Located in `~/android_sdk/scripts/` after setup:
 ## How It Works
 
 ### A10 (Android 10)
-- Uses `google_apis` image (no Play Store, easier to root)
-- Runs with `-writable-system` flag for system modifications
-- Burp certificate installed directly to `/system/etc/security/cacerts/`
-- AVB (Android Verified Boot) disabled for persistence
-- Proxy and frida-server auto-configured
+
+- `google_apis` image, `-writable-system`
+- Burp certificate in `/system/etc/security/cacerts/`, AVB disabled for persistence
+- HTTP proxy via `settings put global http_proxy`
 
 ### A14PR (Android 14)
-- Uses `google_apis_playstore` image (includes Play Store)
-- Rooted via Magisk using [rootAVD](https://gitlab.com/newbit/rootAVD)
-- Burp cert via MagiskTrustUserCerts module (user cert promoted to system)
-- System remains unmodified (systemless root)
-- Proxy and frida-server auto-configured
 
-### Tools Installed
+- `google_apis_playstore` image
+- Rooted with [rootAVD](https://gitlab.com/newbit/rootAVD) + Magisk (ramdisk patch)
+
+### Tools (host)
 
 | Tool | Purpose |
 |------|---------|
-| **frida-tools** | Dynamic instrumentation for app analysis |
-| **frida-server** | Server component pushed to emulators |
-| **objection** | Runtime mobile exploration using Frida |
-| **apkleaks** | Scan APKs for URIs, endpoints, and secrets |
-| **jadx** | Java decompiler for APK reverse engineering |
-| **apktool** | APK unpacker and repacker |
-| **adb** | Android Debug Bridge for device communication |
-| **Magisk** | Systemless root and module framework |
+| **frida-tools** | Dynamic instrumentation (install with pipx) |
+| **objection** | Runtime exploration (pipx) |
+| **apkleaks** | Scan APKs for secrets (pipx) |
+| **pyapktool** | APK tooling (pipx) |
+| **jadx** | Decompiler — install via distro package manager |
+| **adb** | From platform-tools |
 
 ### Environment Variables
 
-Added to your shell RC file (`~/.zshrc` or `~/.bashrc`):
+Added to your shell RC (`~/.zshrc` or `~/.bashrc`):
+
 ```bash
 export ANDROID_HOME=$HOME/android_sdk
 export PATH="$HOME/android_sdk/cmdline-tools/latest/bin:$PATH"

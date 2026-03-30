@@ -9,94 +9,6 @@ log_ok()    { echo "[✓] $*"; }
 log_warn()  { echo "[!] $*" >&2; }
 log_fatal() { echo "[!] $*" >&2; exit 1; }
 
-# ─── OS / Distro Detection ────────────────────────────────────────────────────
-
-detect_distro() {
-    if [[ ! -f /etc/os-release ]]; then
-        echo "unknown"
-        return
-    fi
-    local id
-    id=$(. /etc/os-release && echo "${ID:-unknown}")
-    case "$id" in
-        arch|endeavouros|manjaro) echo "arch" ;;
-        debian|raspbian)          echo "debian" ;;
-        ubuntu|linuxmint|pop)     echo "ubuntu" ;;
-        fedora)                   echo "fedora" ;;
-        *)                        echo "unknown" ;;
-    esac
-}
-
-# ─── Package Manager ──────────────────────────────────────────────────────────
-
-# Maps generic package names to distro-specific names and installs them.
-# Usage: pkg_install jdk pipx openssl git unzip
-pkg_install() {
-    local distro
-    distro=$(detect_distro)
-
-    local -a resolved=()
-    for pkg in "$@"; do
-        case "$pkg" in
-            jdk)
-                case "$distro" in
-                    arch)           resolved+=("jdk") ;;
-                    debian|ubuntu)  resolved+=("openjdk-17-jdk") ;;
-                    fedora)         resolved+=("java-17-openjdk") ;;
-                    *)              log_fatal "Cannot resolve package '$pkg' for distro '$distro'" ;;
-                esac ;;
-            pipx)
-                case "$distro" in
-                    arch)           resolved+=("python-pipx") ;;
-                    debian|ubuntu)  resolved+=("pipx") ;;
-                    fedora)         resolved+=("pipx") ;;
-                    *)              log_fatal "Cannot resolve package '$pkg' for distro '$distro'" ;;
-                esac ;;
-            jadx)
-                case "$distro" in
-                    arch)           resolved+=("jadx") ;;
-                    debian|ubuntu)  resolved+=("jadx") ;;
-                    fedora)         resolved+=("jadx") ;;
-                    *)              log_warn "Cannot resolve package '$pkg' for distro '$distro' — install manually"; continue ;;
-                esac ;;
-            apktool)
-                case "$distro" in
-                    arch)           resolved+=("apktool") ;;
-                    debian|ubuntu)  resolved+=("apktool") ;;
-                    fedora)         resolved+=("apktool") ;;
-                    *)              log_warn "Cannot resolve package '$pkg' for distro '$distro' — install manually"; continue ;;
-                esac ;;
-            openssl|git|unzip|curl)
-                resolved+=("$pkg") ;;
-            *)
-                resolved+=("$pkg") ;;
-        esac
-    done
-
-    log_info "Installing packages: ${resolved[*]}"
-    case "$distro" in
-        arch)
-            if command -v yay >/dev/null 2>&1; then
-                yay -S --noconfirm --needed "${resolved[@]}" || log_fatal "Package installation failed (yay)"
-            elif command -v pacman >/dev/null 2>&1; then
-                sudo pacman -S --noconfirm --needed "${resolved[@]}" || log_fatal "Package installation failed (pacman)"
-            else
-                log_fatal "No supported package manager found (need yay or pacman)"
-            fi ;;
-        debian|ubuntu)
-            sudo apt-get update -qq || log_fatal "apt-get update failed"
-            sudo apt-get install -y "${resolved[@]}" || log_fatal "Package installation failed (apt)"
-            ;;
-        fedora)
-            sudo dnf install -y "${resolved[@]}" || log_fatal "Package installation failed (dnf)"
-            ;;
-        *)
-            log_fatal "Unsupported distro '$distro'. Please install manually: ${resolved[*]}"
-            ;;
-    esac
-    log_ok "Packages installed"
-}
-
 # ─── Shell Detection ──────────────────────────────────────────────────────────
 
 # Returns the path to the user's shell RC file
@@ -108,6 +20,34 @@ detect_shell_rc() {
         bash) echo "$HOME/.bashrc" ;;
         *)    echo "$HOME/.bashrc" ;;
     esac
+}
+
+# git and pipx must be installed via the system package manager; jadx is optional (recommended).
+prompt_host_prerequisites() {
+    echo ""
+    echo "This script does not install host packages — use your distro package manager."
+    echo "  git   — clone rootAVD (required)"
+    echo "  pipx  — frida-tools, objection, apkleaks, pyapktool (required)"
+    echo "  jadx  — APK decompilation (optional, recommended)"
+    read -rp "Confirm git and pipx are already installed [y/N]: " resp
+    case "$resp" in
+        [yY][eE][sS]|[yY]) ;;
+        *) log_fatal "Install git and pipx, then re-run setup.sh." ;;
+    esac
+    local missing=()
+    local cmd
+    for cmd in git pipx; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        log_fatal "Not found in PATH: ${missing[*]}"
+    fi
+    log_ok "Required tools on PATH: git, pipx"
+    if command -v jadx >/dev/null 2>&1; then
+        log_ok "jadx found on PATH"
+    else
+        log_warn "jadx not on PATH — install your distro's jadx package for static analysis"
+    fi
 }
 
 # ─── Android SDK Helpers ──────────────────────────────────────────────────────
@@ -244,74 +184,6 @@ adb_root_and_wait() {
     return 1
 }
 
-# ─── Frida Server Management ─────────────────────────────────────────────────
-
-# Download and push frida-server to the connected emulator.
-# Requires: adb connected, device rooted, frida-tools installed on host.
-install_frida_server() {
-    log_info "Installing frida-server on device..."
-
-    # Get frida version from host tools (client/server MUST match)
-    local frida_version
-    frida_version=$(frida --version 2>/dev/null) || {
-        log_warn "frida not found on host — skipping frida-server install"
-        return 1
-    }
-
-    # Detect device architecture
-    local device_arch
-    device_arch=$(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r\n')
-    if [[ -z "$device_arch" ]]; then
-        log_warn "Could not detect device architecture"
-        return 1
-    fi
-
-    log_info "Frida version: $frida_version, device arch: $device_arch"
-
-    local download_name="frida-server-${frida_version}-android-${device_arch}.xz"
-    local download_url="https://github.com/frida/frida/releases/download/${frida_version}/${download_name}"
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-
-    # Download frida-server
-    log_info "Downloading frida-server from GitHub..."
-    if ! curl -fsSL "$download_url" -o "$tmp_dir/$download_name"; then
-        rm -rf "$tmp_dir"
-        log_warn "Failed to download frida-server (version mismatch or network issue)"
-        return 1
-    fi
-
-    # Extract
-    xz -d "$tmp_dir/$download_name" || {
-        rm -rf "$tmp_dir"
-        log_warn "Failed to extract frida-server"
-        return 1
-    }
-
-    local server_binary="$tmp_dir/frida-server-${frida_version}-android-${device_arch}"
-
-    # Push to device
-    adb push "$server_binary" /data/local/tmp/frida-server || {
-        rm -rf "$tmp_dir"
-        log_warn "Failed to push frida-server to device"
-        return 1
-    }
-
-    adb shell chmod 755 /data/local/tmp/frida-server
-
-    # Verify
-    local remote_version
-    remote_version=$(adb shell /data/local/tmp/frida-server --version 2>/dev/null | tr -d '\r\n' || true)
-    rm -rf "$tmp_dir"
-
-    if [[ "$remote_version" == "$frida_version" ]]; then
-        log_ok "frida-server $frida_version installed on device"
-        return 0
-    else
-        log_warn "frida-server verification failed (expected $frida_version, got '${remote_version:-nothing}')"
-        return 1
-    fi
-}
 
 # ─── Proxy Configuration ─────────────────────────────────────────────────────
 
@@ -338,84 +210,4 @@ configure_proxy() {
         log_warn "Proxy verification failed (got: '${current_proxy:-empty}')"
         return 1
     fi
-}
-
-# ─── Magisk Module Management ────────────────────────────────────────────────
-
-# Install a Magisk module from a zip file on the device.
-# Usage: install_magisk_module /sdcard/Module.zip
-install_magisk_module() {
-    local module_path="$1"
-
-    log_info "Installing Magisk module: $module_path"
-    local result
-    result=$(adb shell su -c "magisk --install-module '$module_path'" 2>&1) || {
-        log_warn "Magisk module installation failed: $result"
-        return 1
-    }
-    log_ok "Magisk module installed"
-    return 0
-}
-
-# Install Burp certificate on a Magisk-rooted device using MagiskTrustUserCerts.
-# Requires: device rooted with Magisk, MagiskTrustUserCerts.zip available, burp.der available.
-install_burp_cert_magisk() {
-    local android_home
-    android_home=$(get_android_home)
-    local module_zip="$android_home/rootAVD/MagiskTrustUserCerts.zip"
-
-    if [[ ! -f "$module_zip" ]]; then
-        log_warn "MagiskTrustUserCerts.zip not found at $module_zip — skipping cert install"
-        return 1
-    fi
-
-    if [[ ! -f "burp.der" ]]; then
-        log_warn "burp.der not found — skipping A14PR cert install"
-        return 1
-    fi
-
-    # Push and install the Magisk module
-    log_info "Pushing MagiskTrustUserCerts module to device..."
-    adb push "$module_zip" /sdcard/MagiskTrustUserCerts.zip || {
-        log_warn "Failed to push module to device"
-        return 1
-    }
-    install_magisk_module /sdcard/MagiskTrustUserCerts.zip || return 1
-
-    # Convert and install burp cert as user certificate
-    log_info "Installing Burp certificate as user cert..."
-    local tmp_pem
-    tmp_pem=$(mktemp)
-    openssl x509 -inform der -in burp.der -out "$tmp_pem" 2>/dev/null || {
-        rm -f "$tmp_pem"
-        log_warn "Failed to convert burp.der"
-        return 1
-    }
-
-    adb push "$tmp_pem" /sdcard/burp-cert.pem || {
-        rm -f "$tmp_pem"
-        log_warn "Failed to push certificate to device"
-        return 1
-    }
-    rm -f "$tmp_pem"
-
-    # Install user cert via su (direct copy to user cert store)
-    adb shell su -c "mkdir -p /data/misc/user/0/cacerts-added" 2>/dev/null || true
-    local hash
-    hash=$(openssl x509 -inform der -in burp.der -out /dev/stdout 2>/dev/null | \
-           openssl x509 -subject_hash_old 2>/dev/null | head -1 | tr -d '\r\n')
-
-    if [[ -n "$hash" ]]; then
-        adb push burp.der /sdcard/burp.der
-        adb shell su -c "openssl x509 -inform der -in /sdcard/burp.der -out /data/misc/user/0/cacerts-added/${hash}.0" 2>/dev/null || {
-            log_warn "Direct cert install failed — install manually via Settings after reboot"
-        }
-        adb shell su -c "chmod 644 /data/misc/user/0/cacerts-added/${hash}.0" 2>/dev/null || true
-    fi
-
-    log_ok "MagiskTrustUserCerts installed — cert will be promoted to system store on reboot"
-    log_info "Rebooting to activate module..."
-    adb reboot 2>/dev/null || true
-    wait_for_boot 120 || log_warn "Device did not come back after reboot"
-    return 0
 }

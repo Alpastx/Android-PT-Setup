@@ -73,7 +73,11 @@ run_static_checks() {
 
     echo ""
     echo "=== Static Analysis Tools ==="
-    check_command "jadx"
+    if command -v jadx >/dev/null 2>&1; then
+        check_pass "jadx found: $(command -v jadx)"
+    else
+        check_warn "jadx not in PATH (optional; install distro package for decompilation)"
+    fi
     check_command "apktool"
 
     echo ""
@@ -104,14 +108,6 @@ run_static_checks() {
     echo "=== rootAVD ==="
     check_dir "$android_home/rootAVD" "rootAVD directory"
     check_file "$android_home/rootAVD/Magisk.zip" "Magisk.zip"
-    check_file "$android_home/rootAVD/MagiskTrustUserCerts.zip" "MagiskTrustUserCerts module"
-
-    echo ""
-    echo "=== Frida Scripts ==="
-    check_dir "$android_home/scripts" "Frida scripts directory"
-    check_file "$android_home/scripts/ssl-bypass-universal.js" "Universal SSL bypass script"
-    check_file "$android_home/scripts/ssl-bypass-okhttp.js" "OkHttp SSL bypass script"
-    check_file "$android_home/scripts/root-detection-bypass.js" "Root detection bypass script"
 
     echo ""
     echo "=== Shell Configuration ==="
@@ -165,11 +161,11 @@ run_live_checks() {
         check_warn "$avd_name root access not confirmed (got: '${root_id:-empty}')"
     fi
 
-    # frida-server check
+    # frida-server (optional — not installed by setup; push manually if needed)
     if adb shell "test -f /data/local/tmp/frida-server" 2>/dev/null; then
-        check_pass "$avd_name has frida-server installed"
+        check_pass "$avd_name has frida-server at /data/local/tmp/"
     else
-        check_fail "$avd_name missing frida-server at /data/local/tmp/"
+        check_warn "$avd_name frida-server not on device (install manually if needed)"
     fi
 
     # Proxy check
