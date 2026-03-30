@@ -2,13 +2,20 @@
 
 set -euo pipefail
 
+source "$(dirname "$0")/lib.sh"
+
 confirm_uninstall() {
+    local android_home
+    android_home=$(get_android_home)
+    local rc_file
+    rc_file=$(detect_shell_rc)
+
     echo ""
     echo "[!] This will remove:"
-    echo "    - Android SDK (~/$HOME/android_sdk)"
+    echo "    - Android SDK ($android_home)"
     echo "    - AVDs (A10, A14PR)"
     echo "    - Pentesting tools (frida-tools, objection, frida, apkleaks)"
-    echo "    - Environment entries from ~/.zshrc"
+    echo "    - Environment entries from $rc_file"
     echo ""
     read -rp "Continue? [y/N]: " response
     case "$response" in
@@ -22,27 +29,32 @@ main() {
         confirm_uninstall
     fi
 
-    echo "[*] Stopping emulators..."
+    local android_home
+    android_home=$(get_android_home)
+    local rc_file
+    rc_file=$(detect_shell_rc)
+
+    log_info "Stopping emulators..."
     pkill -f "emulator.*-avd" 2>/dev/null || true
 
-    echo "[*] Removing AVDs..."
+    log_info "Removing AVDs..."
     if command -v avdmanager >/dev/null 2>&1; then
         avdmanager delete avd -n "A10" 2>/dev/null || true
         avdmanager delete avd -n "A14PR" 2>/dev/null || true
     else
-        rm -rf "$HOME/.android/avd/A10.avd" "$HOME/.android/avd/A10.ini" 2>/dev/null || true
-        rm -rf "$HOME/.android/avd/A14PR.avd" "$HOME/.android/avd/A14PR.ini" 2>/dev/null || true
-        rm -rf "$HOME/.config/.android/avd/A10.avd" "$HOME/.config/.android/avd/A10.ini" 2>/dev/null || true
-        rm -rf "$HOME/.config/.android/avd/A14PR.avd" "$HOME/.config/.android/avd/A14PR.ini" 2>/dev/null || true
+        for dir in "$HOME/.android/avd" "$HOME/.config/.android/avd"; do
+            rm -rf "$dir/A10.avd" "$dir/A10.ini" 2>/dev/null || true
+            rm -rf "$dir/A14PR.avd" "$dir/A14PR.ini" 2>/dev/null || true
+        done
     fi
 
-    echo "[*] Removing Android SDK..."
-    rm -rf "$HOME/android_sdk" 2>/dev/null || true
+    log_info "Removing Android SDK..."
+    rm -rf "$android_home" 2>/dev/null || true
 
-    echo "[*] Removing symlink..."
+    log_info "Removing symlink..."
     [[ -L "$HOME/.android" ]] && rm -f "$HOME/.android"
 
-    echo "[*] Uninstalling pentesting tools..."
+    log_info "Uninstalling pentesting tools..."
     if command -v pipx >/dev/null 2>&1; then
         pipx uninstall frida-tools 2>/dev/null || true
         pipx uninstall objection 2>/dev/null || true
@@ -50,27 +62,27 @@ main() {
         pipx uninstall apkleaks 2>/dev/null || true
     fi
 
-    echo "[*] Cleaning ~/.zshrc..."
-    if [[ -f "$HOME/.zshrc" ]]; then
-        cp "$HOME/.zshrc" "$HOME/.zshrc.backup"
-        sed -i '/# Android SDK Paths/d' "$HOME/.zshrc"
-        sed -i '/export ANDROID_HOME/d' "$HOME/.zshrc"
-        sed -i '/android_sdk\/cmdline-tools/d' "$HOME/.zshrc"
-        sed -i '/android_sdk\/platform-tools/d' "$HOME/.zshrc"
-        sed -i '/android_sdk\/emulator/d' "$HOME/.zshrc"
-        sed -i '/# Android Emulator Aliases/d' "$HOME/.zshrc"
-        sed -i "/alias A10=/d" "$HOME/.zshrc"
-        sed -i "/alias A14PR=/d" "$HOME/.zshrc"
+    log_info "Cleaning $rc_file..."
+    if [[ -f "$rc_file" ]]; then
+        cp "$rc_file" "${rc_file}.backup"
+        sed -i '/# Android SDK Paths/d' "$rc_file"
+        sed -i '/export ANDROID_HOME/d' "$rc_file"
+        sed -i '/android_sdk\/cmdline-tools/d' "$rc_file"
+        sed -i '/android_sdk\/platform-tools/d' "$rc_file"
+        sed -i '/android_sdk\/emulator/d' "$rc_file"
+        sed -i '/# Android Emulator Aliases/d' "$rc_file"
+        sed -i '/alias A10=/d' "$rc_file"
+        sed -i '/alias A14PR=/d' "$rc_file"
     fi
 
-    echo "[*] Cleaning downloaded files..."
+    log_info "Cleaning downloaded files..."
     rm -f platform-tools.zip cmdline-tools.zip Magisk.apk Magisk.zip burp.cer 2>/dev/null || true
     rm -f ./*.0 2>/dev/null || true
 
-    echo "[✓] Uninstall completed"
+    log_ok "Uninstall completed"
     echo ""
     echo "Note: jdk and python-pipx were not removed"
-    echo "Run: source ~/.zshrc"
+    echo "Run: source $rc_file"
 }
 
 main "$@"

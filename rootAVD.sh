@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+source "$(dirname "$0")/lib.sh"
+
 show_available_avds() {
     echo "Available AVDs:"
     if command -v avdmanager >/dev/null 2>&1; then
@@ -22,125 +24,179 @@ show_usage() {
 }
 
 A10() {
-    echo "[*] Setting up Android 10 AVD with Burp certificate"
-    
-    
+    log_info "Setting up Android 10 AVD with Burp certificate"
+
+    # Setup cleanup trap
+    trap cleanup EXIT
 
     # Check and install OpenSSL if needed
     if ! command -v openssl >/dev/null 2>&1; then
-        echo "[*] OpenSSL not found, installing..."
-        if ! command -v yay >/dev/null 2>&1; then
-            echo "[!] yay not found. Please install yay first"
-            return 1
-        fi
-        if ! yay -S --noconfirm openssl; then
-            echo "[!] Failed to install OpenSSL"
-            return 1
-        fi
+        log_info "OpenSSL not found, installing..."
+        pkg_install openssl
     fi
-    echo "[✓] OpenSSL is installed"
+    log_ok "OpenSSL is installed"
 
     # Generate certificate files
-    echo "[*] Converting certificate to Android format..."
-    if ! openssl x509 -inform der -in burp.der -out burp.cer >/dev/null 2>&1; then
-        echo "[!] Failed to convert certificate"
-        return 1
+    log_info "Converting certificate to Android format..."
+    if ! openssl x509 -inform der -in burp.der -out burp.cer 2>/dev/null; then
+        log_fatal "Failed to convert certificate. Is burp.der a valid DER certificate?"
     fi
+    register_cleanup "burp.cer"
 
-    # Generate hash and prepare certificate
+    # Generate hash and validate
     local hash
-    hash=$(openssl x509 -inform PEM -subject_hash_old -in burp.cer | head -1)
-    cp burp.cer "${hash}.0"
-    echo "[✓] Certificate prepared: ${hash}.0"
-    echo "[*] Starting Android 10 emulator..."
-    emulator -avd A10 -writable-system >/dev/null 2>&1 &
-
-    echo "[*] Waiting for emulator to start..."
-    adb wait-for-device
-    sleep 10
-    echo "[*] Preparing system for certificate installation..."
-    adb root
-    sleep 5
-    adb shell avbctl disable-verification
-    adb reboot
-    echo "[*] Waiting for device to reboot..."
-    adb wait-for-device
-    sleep 10
-    echo "[*] Installing certificate..."
-    adb root
-    sleep 5
-    adb remount
-    if ! adb push "${hash}.0" /system/etc/security/cacerts/; then
-        echo "[!] Failed to push certificate"
-        return 1
+    hash=$(openssl x509 -inform PEM -subject_hash_old -in burp.cer 2>/dev/null | head -1 | tr -d '\r\n')
+    if [[ -z "$hash" || ! "$hash" =~ ^[a-f0-9]+$ ]]; then
+        log_fatal "Failed to extract valid certificate hash (got: '${hash:-empty}')"
     fi
-    adb shell chmod 644 "/system/etc/security/cacerts/${hash}.0"
-    echo "[*] Applying changes..."
-    adb reboot
-    sleep 20
-    echo "[*] Cleaning up..."
-    pkill -f "emulator.*-avd" || true
-    rm -f burp.cer "${hash}.0"
-    echo "[✓] Android 10 AVD setup completed successfully"
+    cp burp.cer "${hash}.0"
+    register_cleanup "${hash}.0"
+    log_ok "Certificate prepared: ${hash}.0"
+
+    # Start emulator with boot detection (replaces sleep-based waiting)
+    if ! start_emulator "A10" "-writable-system"; then
+        log_fatal "Failed to start A10 emulator"
+    fi
+
+    # Root the device and wait for adbd to restart
+    log_info "Preparing system for certificate installation..."
+    if ! adb_root_and_wait; then
+        log_fatal "Failed to get root access"
+    fi
+
+    # Disable Android Verified Boot
+    log_info "Disabling Android Verified Boot..."
+    if ! adb shell avbctl disable-verification 2>/dev/null; then
+        log_warn "avbctl disable-verification failed (may already be disabled)"
+    fi
+
+    # Reboot and wait for full boot
+    log_info "Rebooting to apply AVB changes..."
+    adb reboot 2>/dev/null || true
+    if ! wait_for_boot 120; then
+        log_fatal "Device failed to reboot after AVB disable"
+    fi
+
+    # Root again after reboot
+    log_info "Re-acquiring root after reboot..."
+    if ! adb_root_and_wait; then
+        log_fatal "Failed to get root access after reboot"
+    fi
+
+    # Remount system partition as read-write
+    log_info "Remounting system as read-write..."
+    if ! adb remount 2>/dev/null; then
+        log_fatal "Failed to remount system partition"
+    fi
+    sleep 2
+
+    # Push certificate to system CA store
+    log_info "Installing certificate to system CA store..."
+    if ! adb push "${hash}.0" /system/etc/security/cacerts/; then
+        log_fatal "Failed to push certificate to device"
+    fi
+
+    # Verify certificate exists on device
+    if ! adb shell "test -f /system/etc/security/cacerts/${hash}.0" 2>/dev/null; then
+        log_fatal "Certificate not found on device after push"
+    fi
+
+    adb shell chmod 644 "/system/etc/security/cacerts/${hash}.0" 2>/dev/null || \
+        log_fatal "Failed to set certificate permissions"
+
+    # Configure proxy to point at Burp on host
+    configure_proxy || log_warn "Proxy configuration failed — configure manually in Settings"
+
+    # Install frida-server on device
+    install_frida_server || log_warn "frida-server install failed — install manually later"
+
+    # Final reboot to apply
+    log_info "Rebooting to apply all changes..."
+    adb reboot 2>/dev/null || true
+    sleep 5
+
+    # Clean up — kill emulator and temp files
+    kill_emulator
+    rm -f burp.cer "${hash}.0" 2>/dev/null || true
+
+    # Disable the trap since we cleaned up manually
+    trap - EXIT
+
+    log_ok "Android 10 AVD setup completed successfully"
+    log_ok "Burp certificate installed to system CA store"
+    log_ok "Proxy configured to 10.0.2.2:${BURP_PORT:-8080}"
 }
 
 # Function to root Android 14
 A14PR() {
-    echo "[*] Setting up Android 14 Pro emulator with root"
+    log_info "Setting up Android 14 Pro emulator with Magisk root"
 
-    local rootavd_dir="$HOME/android_sdk/rootAVD"
-    local system_image="$HOME/android_sdk/system-images/android-34/google_apis_playstore/x86_64/ramdisk.img"
+    # Setup cleanup trap
+    trap cleanup EXIT
+
+    local android_home
+    android_home=$(get_android_home)
+    local rootavd_dir="$android_home/rootAVD"
+    local system_image="$android_home/system-images/android-34/google_apis_playstore/x86_64/ramdisk.img"
 
     # Check if rootAVD exists
     if [[ ! -d "$rootavd_dir" ]]; then
-        echo "[!] rootAVD directory not found"
-        echo "    Please ensure rootAVD is installed in $rootavd_dir"
-        return 1
+        log_fatal "rootAVD directory not found at $rootavd_dir"
+    fi
+
+    if [[ ! -x "$rootavd_dir/rootAVD.sh" ]]; then
+        chmod +x "$rootavd_dir/rootAVD.sh" 2>/dev/null || \
+            log_fatal "rootAVD.sh not found or not executable in $rootavd_dir"
     fi
 
     # Check for system image
     if [[ ! -f "$system_image" ]]; then
-        echo "[!] System image not found: $system_image"
-        echo "    Please ensure Android 14 system image is installed"
-        return 1
+        log_fatal "System image not found: $system_image"
     fi
 
-    echo "[*] Starting Android 14 emulator..."
-    emulator -avd A14PR >/dev/null 2>&1 &
-    
-    echo "[*] Waiting for emulator to boot..."
-    adb wait-for-device
-    sleep 30
+    # Start emulator and wait for full boot
+    if ! start_emulator "A14PR"; then
+        log_fatal "Failed to start A14PR emulator"
+    fi
 
-    echo "[*] Rooting Android 14 emulator..."
-    # Run in subshell to avoid changing directory
+    # Run rootAVD to patch ramdisk with Magisk
+    log_info "Rooting Android 14 emulator with Magisk..."
     (
-        cd "$rootavd_dir" || {
-            echo "[!] Failed to access rootAVD directory"
-            return 1
-        }
-        ./rootAVD.sh system-images/android-34/google_apis_playstore/x86_64/ramdisk.img
-    ) || {
-        echo "[!] Failed to root the emulator"
-        return 1
-    }
+        cd "$rootavd_dir" || log_fatal "Failed to access rootAVD directory"
+        # Use path relative to ANDROID_HOME (go up from rootAVD/ to android_sdk/)
+        ./rootAVD.sh ../system-images/android-34/google_apis_playstore/x86_64/ramdisk.img
+    ) || log_fatal "rootAVD failed to patch ramdisk"
 
-    echo "[*] Waiting for root process to complete..."
-    sleep 10
+    # Wait for rootAVD to finish and device to come back
+    log_info "Waiting for root process to complete..."
+    if ! wait_for_boot 120; then
+        log_warn "Device may need manual reboot after Magisk install"
+        adb reboot 2>/dev/null || true
+        wait_for_boot 120 || log_warn "Device did not come back — check emulator manually"
+    fi
 
-    echo "[*] Rebooting emulator to apply changes..."
-    adb reboot
+    # Install frida-server on device
+    adb_root_and_wait || log_warn "Could not get root — frida-server install may fail"
+    install_frida_server || log_warn "frida-server install failed — install manually later"
 
-    echo "[✓] Android 14 emulator has been rooted successfully"
-    echo "[*] The emulator will restart automatically"
-    echo "[*] After restart, Magisk will be available in the system"
+    # Configure proxy to point at Burp on host
+    configure_proxy || log_warn "Proxy configuration failed — configure manually in Settings"
+
+    # Install Burp certificate via MagiskTrustUserCerts module
+    install_burp_cert_magisk || log_warn "Burp cert install on A14PR failed — install manually"
+
+    # Disable the trap since we're done
+    trap - EXIT
+
+    log_ok "Android 14 emulator has been rooted successfully"
+    log_info "Magisk, frida-server, proxy, and Burp cert configured"
 }
 
 # Main dispatch
 AVD_NAME="${1:-}"
 
 if [[ -z "$AVD_NAME" ]]; then
-    echo "[!] Please provide AVD name as argument"
+    log_warn "Please provide AVD name as argument"
     show_usage
     exit 1
 fi
@@ -153,10 +209,10 @@ case "$AVD_NAME" in
         exit 0
         ;;
     *)
-        echo "[!] Unknown AVD name: $AVD_NAME"
+        log_warn "Unknown AVD name: $AVD_NAME"
         show_available_avds
         exit 1
         ;;
 esac
 
-echo "[✓] Setup completed for $AVD_NAME"
+log_ok "Setup completed for $AVD_NAME"

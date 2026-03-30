@@ -1,0 +1,794 @@
+---
+title: "Automating an Android Penetration Testing Lab from Scratch"
+description: "Build a fully automated Android pentesting environment with rooted emulators, Burp Suite certificate injection, and Magisk — no Android Studio required."
+date: "2026-03-30"
+author: "Alpastx"
+readTime: "18 min read"
+tags: ["android", "penetration-testing", "automation", "mobile-security", "emulator"]
+---
+
+# Automating an Android Penetration Testing Lab from Scratch
+
+In this post, we build a **fully automated** Android penetration testing environment from scratch — no Android Studio, no manual clicking, no guesswork. We download the SDK directly from Google, create two rooted Android Virtual Devices (Android 10 and Android 14), install a Burp Suite certificate into the system CA store, root with Magisk, and install essential pentesting tools — all with a single command. We also explore the internals of how each piece works so you can adapt it to your own workflow.
+
+---
+
+## Why Automate?
+
+If you've ever set up an Android pentesting lab manually, you know the pain:
+
+- Downloading the SDK, organizing folders, setting `ANDROID_HOME`
+- Creating AVDs, patching `config.ini` for hardware keys
+- Converting certificates, disabling AVB, remounting partitions
+- Rooting with Magisk, praying `adb remount` doesn't fail silently
+- Doing it all over again when something breaks
+
+Every step has a timing dependency. Run `adb remount` before the system is fully booted? Silent failure. Push a certificate before getting root? Nothing happens. Forget `hw.keyboard=yes`? Enjoy tapping on-screen keys forever.
+
+**Android-PT-Setup** automates all of this into a single `bash setup.sh` that takes you from zero to two rooted, Burp-ready emulators.
+
+---
+
+## What We're Building
+
+By the end of this setup, you'll have:
+
+| Device | Android Version | Root Method | Key Features |
+|--------|----------------|-------------|-------------|
+| **A10** | Android 10 (API 29) | System root + AVB disabled | Burp CA cert, proxy auto-configured, frida-server |
+| **A14PR** | Android 14 (API 34) | Magisk (systemless) | Play Store, Burp cert via Magisk module, proxy, frida-server |
+
+Plus these tools installed and ready:
+
+- **frida-tools + frida-server** — Dynamic instrumentation (client on host, server on device)
+- **objection** — Frida-powered runtime mobile exploration
+- **apkleaks** — Static scanner for URIs, endpoints, and hardcoded secrets
+- **jadx** — Java decompiler for APK reverse engineering
+- **apktool** — APK unpacker/repacker
+- **Magisk** — Systemless root framework
+- **SSL bypass scripts** — Ready-to-use Frida scripts for pinning bypass and root detection evasion
+
+---
+
+## Prerequisites
+
+You need a Linux machine. The scripts support:
+
+- **Arch Linux** (yay / pacman)
+- **Ubuntu / Debian** (apt)
+- **Fedora** (dnf)
+
+You also need:
+
+- **20GB+ free disk space** (system images are large)
+- **burp.der** — Your Burp Suite CA certificate exported in DER format
+
+To export the certificate from Burp Suite: go to **Proxy → Options → Import / Export CA certificate → Export Certificate in DER format**. Save it as `burp.der` in the project directory.
+
+---
+
+## Project Structure
+
+```
+Android-PT-Setup/
+├── setup.sh               # Main orchestrator — runs everything
+├── lib.sh                 # Shared utility library (detection, boot wait, logging)
+├── Tools-downloader.sh    # Downloads SDK tools + Magisk from official sources
+├── rootAVD.sh             # Roots AVDs (system root for A10, Magisk for A14PR)
+├── HWKeys.sh              # Enables hardware keyboard on AVDs
+├── uninstall.sh           # Clean removal of everything
+└── burp.der               # Your Burp certificate (you provide this)
+```
+
+---
+
+## The Shared Library: `lib.sh`
+
+Before diving into the individual scripts, let's look at the foundation. Every script sources `lib.sh`, which provides cross-distro support and — most importantly — **reliable emulator boot detection**.
+
+### The Boot Detection Problem
+
+The single biggest source of failed rooting attempts is **timing**. The naive approach looks like this:
+
+```bash
+# The classic approach that fails 40% of the time
+adb wait-for-device
+sleep 10          # Is 10 seconds enough? Maybe. Maybe not.
+adb root
+sleep 5           # Hope the device is ready...
+adb remount       # Silent failure if system isn't mounted yet
+```
+
+`adb wait-for-device` returns as soon as the ADB daemon responds — **not** when Android is fully booted. The system partition might still be mounting. SELinux might not be initialized. Your `adb remount` silently fails on a read-only filesystem, and you push your certificate into the void.
+
+The fix is to **poll the actual boot state**:
+
+```bash
+wait_for_boot() {
+    local timeout="${1:-120}"
+    local elapsed=0
+    local interval=3
+
+    log_info "Waiting for device to fully boot (timeout: ${timeout}s)..."
+    adb wait-for-device 2>/dev/null
+
+    while (( elapsed < timeout )); do
+        local boot_status
+        boot_status=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n' || true)
+        if [[ "$boot_status" == "1" ]]; then
+            log_ok "Device booted (${elapsed}s)"
+            return 0
+        fi
+
+        # Check emulator process is still alive
+        if [[ -n "$EMULATOR_PID" ]] && ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+            log_warn "Emulator process (PID $EMULATOR_PID) died"
+            return 1
+        fi
+
+        sleep "$interval"
+        (( elapsed += interval ))
+    done
+
+    log_warn "Boot timeout after ${timeout}s"
+    return 1
+}
+```
+
+This function:
+1. Waits for ADB to see the device
+2. Polls `sys.boot_completed` every 3 seconds
+3. Detects if the emulator process crashed (PID tracking)
+4. Times out after a configurable duration (default 120s)
+
+No more guessing with arbitrary sleeps.
+
+### Cross-Distro Package Management
+
+The library also handles package installation across distros:
+
+```bash
+pkg_install() {
+    local distro
+    distro=$(detect_distro)
+
+    local -a resolved=()
+    for pkg in "$@"; do
+        case "$pkg" in
+            jdk)
+                case "$distro" in
+                    arch)           resolved+=("jdk") ;;
+                    debian|ubuntu)  resolved+=("openjdk-17-jdk") ;;
+                    fedora)         resolved+=("java-17-openjdk") ;;
+                esac ;;
+            pipx)
+                case "$distro" in
+                    arch)           resolved+=("python-pipx") ;;
+                    debian|ubuntu)  resolved+=("pipx") ;;
+                    fedora)         resolved+=("pipx") ;;
+                esac ;;
+            # openssl, git, unzip, curl — same name everywhere
+            *)  resolved+=("$pkg") ;;
+        esac
+    done
+
+    case "$distro" in
+        arch)           yay -S --noconfirm --needed "${resolved[@]}" ;;
+        debian|ubuntu)  sudo apt-get install -y "${resolved[@]}" ;;
+        fedora)         sudo dnf install -y "${resolved[@]}" ;;
+    esac
+}
+```
+
+So in any script, you just write `pkg_install jdk pipx openssl` and it does the right thing on Arch, Ubuntu, or Fedora.
+
+---
+
+## Step 1: Downloading the SDK Tools
+
+`Tools-downloader.sh` grabs three things from official sources:
+
+1. **Platform tools** (adb, fastboot) — from `dl.google.com`
+2. **Command-line tools** (sdkmanager, avdmanager) — URL extracted dynamically from the Android Studio download page
+3. **Magisk** — latest APK from GitHub releases API
+
+```bash
+# Platform tools — straightforward download
+PlatformToolsL="https://dl.google.com/android/repository/platform-tools-latest-linux.zip"
+
+# Cmdline tools — we scrape the actual download URL from Google's page
+url=$(curl -fsSL "https://developer.android.com/studio#cmdline-tools" | \
+  grep -oP 'https://dl.google.com/android/repository/commandlinetools-linux-[0-9]+_latest\.zip' | \
+  head -n 1)
+
+# Magisk — latest release from GitHub API
+release_json=$(curl -fsSL "https://api.github.com/repos/topjohnwu/Magisk/releases/latest")
+apk_url=$(echo "$release_json" | \
+  grep -oP '"browser_download_url":\s*"\K[^"]+Magisk-v[^"]+\.apk' | \
+  head -n 1)
+```
+
+Each download is cached — if the file already exists, it skips. This means you can re-run `setup.sh` without re-downloading everything.
+
+> **Note on Magisk naming**: The file downloads as an APK but gets saved as `Magisk.zip`. This is intentional — APK files are valid ZIPs, and rootAVD expects `Magisk.zip` as input.
+
+---
+
+## Step 2: SDK Organization and Environment Setup
+
+After downloading, `setup.sh` organizes everything into a clean SDK structure:
+
+```
+~/android_sdk/
+├── cmdline-tools/
+│   └── latest/
+│       └── bin/
+│           ├── avdmanager
+│           ├── sdkmanager
+│           └── ...
+├── platform-tools/
+│   ├── adb
+│   ├── fastboot
+│   └── ...
+├── emulator/
+├── system-images/
+├── platforms/
+└── rootAVD/
+    ├── rootAVD.sh
+    └── Magisk.zip
+```
+
+The script auto-detects your shell and appends environment variables to the correct RC file:
+
+```bash
+rc_file=$(detect_shell_rc)  # Returns ~/.zshrc or ~/.bashrc
+
+if ! grep -q 'ANDROID_HOME' "$rc_file" 2>/dev/null; then
+    cat >> "$rc_file" << 'EOL'
+
+# Android SDK Paths
+export ANDROID_HOME=$HOME/android_sdk
+export PATH="$HOME/android_sdk/cmdline-tools/latest/bin:$PATH"
+export PATH="$HOME/android_sdk/platform-tools:$PATH"
+export PATH="$HOME/android_sdk/emulator:$PATH"
+
+# Android Emulator Aliases
+alias A10='emulator -avd A10 -writable-system'
+alias A14PR='emulator -avd A14PR'
+EOL
+fi
+```
+
+The `grep` check ensures idempotency — running setup twice won't duplicate your PATH entries.
+
+---
+
+## Step 3: Installing System Images and Creating AVDs
+
+With `sdkmanager` now in PATH, we install two system images:
+
+```bash
+# Android 10 — google_apis (no Play Store, easier to root via system modification)
+sdkmanager --install "system-images;android-29;google_apis;x86"
+
+# Android 14 — google_apis_playstore (includes Play Store, rooted via Magisk)
+sdkmanager --install "system-images;android-34;google_apis_playstore;x86_64"
+```
+
+**Why two different image types?**
+
+- `google_apis` (A10): No Play Store, but the system partition can be modified directly. Perfect for installing CA certificates into `/system/etc/security/cacerts/`.
+- `google_apis_playstore` (A14PR): Includes Google Play Store for testing real-world app behavior. System partition is protected, so we use Magisk for systemless root.
+
+Then we create the AVDs:
+
+```bash
+avdmanager create avd -n "A10" -k "system-images;android-29;google_apis;x86" --force
+avdmanager create avd -n "A14PR" -k "system-images;android-34;google_apis_playstore;x86_64" --force
+```
+
+### Fixing Hardware Keys
+
+Fresh AVDs have broken hardware buttons by default. `HWKeys.sh` patches each AVD's `config.ini`:
+
+```bash
+# The script searches both possible AVD config locations
+for dir in "$HOME/.android/avd" "$HOME/.config/.android/avd"; do
+    if [[ -f "$dir/${AVD_NAME}.avd/config.ini" ]]; then
+        ConfigFile="$dir/${AVD_NAME}.avd/config.ini"
+        break
+    fi
+done
+
+sed -i '/^hw\.keyboard=/d' "$ConfigFile"
+sed -i '/^hw\.mainKeys=/d' "$ConfigFile"
+echo "hw.keyboard=yes" >> "$ConfigFile"
+echo "hw.mainKeys=yes" >> "$ConfigFile"
+```
+
+Without this, you're stuck tapping the on-screen keyboard for every command.
+
+---
+
+## Step 4: Rooting A10 and Installing the Burp Certificate
+
+This is where most manual setups fail. The A10 rooting process requires a precise sequence with proper timing between each step. Here's how `rootAVD.sh` handles it:
+
+### Certificate Preparation
+
+First, we convert the Burp certificate from DER to PEM format and generate the hash Android uses for CA certificate filenames:
+
+```bash
+# Convert DER to PEM
+openssl x509 -inform der -in burp.der -out burp.cer
+
+# Generate the hash Android uses for cert filenames
+hash=$(openssl x509 -inform PEM -subject_hash_old -in burp.cer | head -1)
+
+# Validate the hash is actually hex
+if [[ -z "$hash" || ! "$hash" =~ ^[a-f0-9]+$ ]]; then
+    log_fatal "Failed to extract valid certificate hash"
+fi
+
+# Android expects certs named as <hash>.0
+cp burp.cer "${hash}.0"
+```
+
+Android's system certificate store at `/system/etc/security/cacerts/` expects certificates named `<subject_hash>.0`. The `-subject_hash_old` flag generates the hash format Android actually uses (OpenSSL's old algorithm).
+
+### The Rooting Sequence
+
+```bash
+# 1. Start emulator with writable system and WAIT FOR FULL BOOT
+start_emulator "A10" "-writable-system"
+
+# 2. Get root access (with retry logic)
+adb_root_and_wait
+
+# 3. Disable Android Verified Boot
+adb shell avbctl disable-verification
+
+# 4. Reboot and wait for FULL boot (not just adb connection)
+adb reboot
+wait_for_boot 120
+
+# 5. Root again after reboot
+adb_root_and_wait
+
+# 6. Remount system as read-write
+adb remount
+
+# 7. Push certificate and set permissions
+adb push "${hash}.0" /system/etc/security/cacerts/
+adb shell chmod 644 "/system/etc/security/cacerts/${hash}.0"
+
+# 8. Verify it's actually there
+adb shell "test -f /system/etc/security/cacerts/${hash}.0"
+
+# 9. Final reboot to apply
+adb reboot
+```
+
+Every single step has error checking. Every boot wait uses `sys.boot_completed` polling instead of arbitrary sleeps. The emulator PID is tracked so we detect crashes instantly. And if anything fails, a trap handler kills the emulator and cleans up temp files.
+
+**Why does this work?**
+
+1. `-writable-system` tells the emulator to allow system partition modifications
+2. `avbctl disable-verification` disables Android Verified Boot, which would otherwise reject our modified system partition on next boot
+3. `adb remount` remounts `/system` as read-write so we can push files
+4. The certificate goes into `/system/etc/security/cacerts/` — the **system** CA store, not the user store. This means apps that only trust system CAs will trust our Burp certificate
+
+---
+
+## Step 5: Rooting A14PR with Magisk
+
+Android 14 with Play Store images protects the system partition more aggressively. Instead of modifying the system directly, we use **Magisk** for systemless root — it patches the `ramdisk.img` to inject root capabilities without touching `/system`.
+
+We use [rootAVD](https://gitlab.com/newbit/rootAVD) — a tool specifically designed to root Android Virtual Devices with Magisk.
+
+```bash
+A14PR() {
+    local android_home
+    android_home=$(get_android_home)
+    local rootavd_dir="$android_home/rootAVD"
+    local system_image="$android_home/system-images/android-34/google_apis_playstore/x86_64/ramdisk.img"
+
+    # Start emulator and wait for FULL boot
+    start_emulator "A14PR"
+
+    # Run rootAVD to patch ramdisk with Magisk
+    (
+        cd "$rootavd_dir"
+        ./rootAVD.sh ../system-images/android-34/google_apis_playstore/x86_64/ramdisk.img
+    )
+
+    # Wait for device to come back after rootAVD does its thing
+    wait_for_boot 120
+}
+```
+
+**How rootAVD works under the hood:**
+
+1. It takes the path to the AVD's `ramdisk.img`
+2. Unpacks the ramdisk
+3. Injects Magisk's init scripts and binaries
+4. Repacks the ramdisk
+5. On next boot, Magisk initializes before the Android framework, providing root
+
+After this, you'll have the Magisk app available in the system. You can install Magisk modules (like a certificate installer module for A14PR if needed).
+
+> **Path gotcha**: rootAVD expects the ramdisk path relative to `$ANDROID_HOME`. Since we `cd` into the rootAVD directory, we use `../system-images/...` to go up one level to the SDK root. Getting this path wrong is one of the most common failure modes.
+
+---
+
+## Step 6: Pentesting Tools
+
+The setup installs three essential tools via `pipx`:
+
+```bash
+pipx install frida-tools   # Dynamic instrumentation
+pipx install objection      # Frida-based runtime exploration
+pipx install apkleaks       # Static APK analysis
+```
+
+### Frida
+
+[Frida](https://frida.re/) is the backbone of dynamic Android analysis. It lets you hook into running processes, bypass SSL pinning, modify function behavior, and trace API calls at runtime. The `frida-tools` package gives you:
+
+- `frida` — Interactive REPL for hooking
+- `frida-trace` — Trace function calls
+- `frida-ps` — List processes on the device
+
+### Objection
+
+[Objection](https://github.com/sensepost/objection) wraps Frida with a user-friendly interface for common mobile testing tasks:
+
+```bash
+objection -g com.example.app explore
+# Then inside the REPL:
+android sslpinning disable
+android hooking list activities
+android hooking watch class com.example.app.LoginActivity
+```
+
+### APKLeaks
+
+[APKLeaks](https://github.com/dwisiswant0/apkleaks) performs static analysis on APK files to find hardcoded URLs, API keys, and secrets:
+
+```bash
+apkleaks -f target.apk
+```
+
+### Static Analysis: jadx and apktool
+
+The setup also installs **jadx** (Java decompiler) and **apktool** (APK unpacker/repacker) via your system package manager:
+
+```bash
+# Decompile an APK to readable Java source
+jadx -d output/ target.apk
+
+# Unpack APK for resource inspection and repackaging
+apktool d target.apk -o unpacked/
+```
+
+These are essential for understanding app internals before dynamic testing.
+
+---
+
+## Step 7: Auto-Pushing Frida Server to Emulators
+
+Having `frida-tools` on the host is only half the equation. You also need `frida-server` running on the device. The setup handles this automatically.
+
+The `install_frida_server()` function in `lib.sh`:
+
+1. **Reads the host frida version** via `frida --version` — client and server MUST match exactly
+2. **Detects device architecture** via `adb shell getprop ro.product.cpu.abi` (x86 for A10, x86_64 for A14PR)
+3. **Downloads the matching server** from GitHub releases
+4. **Pushes to `/data/local/tmp/frida-server`** and makes it executable
+5. **Verifies** the version matches
+
+```bash
+install_frida_server() {
+    local frida_version
+    frida_version=$(frida --version 2>/dev/null)
+
+    local device_arch
+    device_arch=$(adb shell getprop ro.product.cpu.abi | tr -d '\r\n')
+
+    local download_url="https://github.com/frida/frida/releases/download/${frida_version}/frida-server-${frida_version}-android-${device_arch}.xz"
+
+    curl -fsSL "$download_url" -o /tmp/frida-server.xz
+    xz -d /tmp/frida-server.xz
+    adb push /tmp/frida-server /data/local/tmp/frida-server
+    adb shell chmod 755 /data/local/tmp/frida-server
+}
+```
+
+To use it after setup, start the server on the emulator and connect from your host:
+
+```bash
+# Start frida-server on device
+adb shell "/data/local/tmp/frida-server &"
+
+# List processes from host
+frida-ps -U
+
+# Hook an app
+frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
+```
+
+---
+
+## Step 8: Auto-Configuring the Burp Proxy
+
+Instead of manually navigating Settings > Wi-Fi > Proxy on each emulator, the setup configures the proxy automatically:
+
+```bash
+configure_proxy() {
+    local port="${1:-${BURP_PORT:-8080}}"
+    local host="10.0.2.2"  # Android emulator alias for host's 127.0.0.1
+
+    adb shell settings put global http_proxy "${host}:${port}"
+}
+```
+
+**Why `10.0.2.2`?** Android emulators use a virtual network where `10.0.2.2` always maps to the host machine's loopback. No need to detect your actual IP.
+
+The proxy is configured during setup. If you need to change the port:
+
+```bash
+BURP_PORT=9090 bash setup.sh
+```
+
+Or change it later on a running emulator:
+
+```bash
+adb shell settings put global http_proxy 10.0.2.2:9090
+```
+
+To remove the proxy:
+
+```bash
+adb shell settings delete global http_proxy
+```
+
+---
+
+## Step 9: Burp Certificate on A14PR via Magisk
+
+A10 gets the Burp certificate directly in the system CA store (writable system). But A14PR's system partition is protected — we can't just push files to `/system/`.
+
+The solution: **MagiskTrustUserCerts** — a Magisk module that automatically copies user-installed certificates to the system store on every boot.
+
+The setup:
+1. Downloads the MagiskTrustUserCerts module from GitHub during `Tools-downloader.sh`
+2. After Magisk rooting completes, pushes and installs the module via `magisk --install-module`
+3. Installs the Burp cert as a user certificate
+4. Reboots — the module promotes the user cert to system trust
+
+This means both A10 and A14PR trust your Burp certificate at the system level, allowing HTTPS interception for apps that only trust system CAs.
+
+---
+
+## Step 10: Bundled Frida Scripts for SSL & Root Bypass
+
+The `scripts/` directory contains ready-to-use Frida scripts:
+
+### Universal SSL Pinning Bypass (`ssl-bypass-universal.js`)
+
+Hooks 8 different SSL verification mechanisms simultaneously:
+- `TrustManagerImpl.verifyChain` (Android default)
+- `X509TrustManager.checkServerTrusted`
+- `okhttp3.CertificatePinner.check` (and obfuscated variants)
+- `Conscrypt.verifyCertificateChain`
+- `WebViewClient.onReceivedSslError`
+- `NetworkSecurityTrustManager`
+- `HostnameVerifier`
+- Legacy OkHttp v2
+
+```bash
+frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
+```
+
+### Root Detection Bypass (`root-detection-bypass.js`)
+
+Hides root indicators from apps that check:
+- File existence (`/system/bin/su`, `/sbin/magisk`, etc.)
+- `Build.TAGS` (changes `test-keys` to `release-keys`)
+- `Runtime.exec("su")` and `ProcessBuilder`
+- `SystemProperties` (`ro.debuggable`, `ro.build.type`)
+- `PackageManager` (hides Magisk, SuperSU packages)
+- Native `access()` calls via libc hooks
+
+```bash
+# Combine both for maximum compatibility
+frida -U -f com.example.app \
+  -l ~/android_sdk/scripts/ssl-bypass-universal.js \
+  -l ~/android_sdk/scripts/root-detection-bypass.js
+```
+
+---
+
+## Verifying Your Setup
+
+After setup completes, run the health check:
+
+```bash
+bash verify.sh
+```
+
+This validates:
+- Environment variables and PATH
+- All tools installed (adb, frida, objection, jadx, apktool)
+- AVDs exist (A10, A14PR)
+- System images present
+- Frida scripts installed
+- Shell configuration correct
+
+For a deeper check that starts emulators and validates root, certs, and proxy:
+
+```bash
+bash verify.sh --live
+```
+
+Example output:
+```
+╔══════════════════════════════════════════════╗
+║   Android-PT-Setup Verification              ║
+╚══════════════════════════════════════════════╝
+
+=== Environment ===
+  [PASS] ANDROID_HOME set: /home/user/android_sdk
+  [PASS] Android SDK directory exists
+
+=== SDK Tools ===
+  [PASS] adb found: /home/user/android_sdk/platform-tools/adb
+  [PASS] emulator found: /home/user/android_sdk/emulator/emulator
+  ...
+
+=== Pentesting Tools ===
+  [PASS] frida found: /home/user/.local/bin/frida
+  [PASS] objection found: /home/user/.local/bin/objection
+  ...
+
+════════════════════════════════════════════════
+  Results: 18 passed, 0 failed, 0 warnings
+════════════════════════════════════════════════
+```
+
+---
+
+## Usage
+
+After setup completes, launch your emulators with the shell aliases:
+
+```bash
+# Launch Android 10 (rooted, Burp cert installed, writable system)
+A10
+
+# Launch Android 14 (Magisk root, Play Store)
+A14PR
+```
+
+To verify the Burp certificate is installed on A10:
+
+```bash
+# Start A10 and check the cert
+adb shell ls /system/etc/security/cacerts/ | grep $(openssl x509 -inform der -in burp.der -out /dev/stdout 2>/dev/null | openssl x509 -subject_hash_old | head -1)
+```
+
+To verify Magisk root on A14PR:
+
+```bash
+adb shell su -c id
+# Should output: uid=0(root) gid=0(root)
+```
+
+---
+
+## Intercepting HTTPS Traffic with Burp Suite
+
+With the Burp certificate and proxy auto-configured on both emulators, interception is nearly zero-config:
+
+1. **Start Burp Suite** and ensure the proxy listener is on `127.0.0.1:8080` (or your custom `BURP_PORT`)
+2. **Start the emulator**: `A10` or `A14PR`
+3. **Browse** — HTTPS traffic appears in Burp immediately
+
+The proxy is already pointed at `10.0.2.2:8080` (your host), and the Burp CA is in the system store. No manual Settings navigation needed.
+
+For apps with SSL pinning, start frida-server and use the bypass scripts:
+
+```bash
+# On the emulator (background frida-server)
+adb shell "/data/local/tmp/frida-server &"
+
+# On your host (bypass pinning + intercept)
+frida -U -f com.example.app -l ~/android_sdk/scripts/ssl-bypass-universal.js
+```
+
+---
+
+## Clean Uninstall
+
+Remove everything with:
+
+```bash
+bash uninstall.sh
+```
+
+This will:
+- Kill running emulators
+- Delete both AVDs
+- Remove the entire `~/android_sdk/` directory
+- Uninstall frida-tools, objection, and apkleaks
+- Clean up environment variables from your shell RC file
+- Create a backup of your RC file before modifying it
+
+Use `bash uninstall.sh -f` to skip the confirmation prompt.
+
+---
+
+## Reliability: What Makes This Different
+
+The key differentiator from manual setup or basic scripts is the **reliability layer** in `lib.sh`. Here's a summary of what it handles:
+
+| Problem | Manual Approach | Our Approach |
+|---------|----------------|--------------|
+| Emulator not fully booted | `sleep 10` and hope | Poll `sys.boot_completed` with 120s timeout |
+| Emulator crashes mid-setup | Commands hang forever | PID tracking + crash detection |
+| `adb root` fails silently | Don't notice until later | Retry up to 3 times with boot verification |
+| Temp files left after failure | Manual cleanup | `trap cleanup EXIT` |
+| Wrong distro packages | Edit script manually | Auto-detection: Arch/Ubuntu/Fedora |
+| Wrong shell RC file | Hardcoded `.zshrc` | Auto-detect from `$SHELL` |
+| Re-running setup duplicates config | Double PATH entries | `grep` check before appending |
+| frida client/server mismatch | Manual version matching | Auto-detect host version, download matching server |
+| No proxy on emulator | Manual Settings navigation | Auto-configure via `adb shell settings put` |
+| No cert on A14PR | Manual Magisk module install | Auto-install MagiskTrustUserCerts |
+
+---
+
+## Troubleshooting
+
+**Emulator fails to start**
+- Check you have enough disk space (`df -h`)
+- Verify KVM is available: `ls /dev/kvm` (needed for hardware acceleration)
+- On some systems: `sudo usermod -aG kvm $USER` and re-login
+
+**`adb remount` fails on A10**
+- The emulator MUST be started with `-writable-system`
+- AVB must be disabled first (`avbctl disable-verification` + reboot)
+- The device must be fully booted (not just past the ADB daemon startup)
+
+**rootAVD fails for A14PR**
+- Ensure `Magisk.zip` exists in `~/android_sdk/rootAVD/`
+- Ensure the system image is installed: `ls ~/android_sdk/system-images/android-34/`
+- Check the ramdisk path matches your architecture
+
+**Frida can't connect**
+- Ensure frida-server is running: `adb shell "/data/local/tmp/frida-server &"`
+- Check version match: `frida --version` on host should match `adb shell /data/local/tmp/frida-server --version`
+- Ensure the emulator is running and `adb devices` shows it
+
+---
+
+## What's Next
+
+From here, you can:
+
+- **Add more AVDs** with different API levels for broader testing coverage
+- **Install additional Magisk modules** on A14PR (Hide My Applist, Zygisk, etc.)
+- **Write custom Frida scripts** for app-specific bypasses
+- **Automate APK installation** and batch testing with custom scripts
+- **Connect external VMs** to the emulators using port forwarding
+- **Run `bash verify.sh --live`** periodically to ensure everything still works
+
+The entire project is open source. Clone it, adapt it, break it, fix it:
+
+```bash
+git clone https://github.com/Alpastx/Android-PT-Setup.git
+cd Android-PT-Setup
+# Place your burp.der here
+bash setup.sh
+```
+
+Happy hacking.
